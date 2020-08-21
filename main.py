@@ -7,8 +7,11 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from kubernetes import client, config, watch
 import requests
+from dotenv import load_dotenv
 
 from config import Config
+
+load_dotenv()
 
 logger = logging.getLogger("external-dns-pihole")
 logger.setLevel(logging.INFO)
@@ -24,6 +27,9 @@ def ingress_event(extV1beta):
       dns_records_resp = requests.get(f'http://{Config.PIHOLE_DNS}/dns')
       if dns_records_resp.ok:
         dns_records = dns_records_resp.json()["Content"]
+      else:
+        logger.error("Couldnt reach pi.hole")
+        pass
       missing_record = ""
       for rule in event["object"].spec.rules:
         if Config.DOMAIN_NAME in rule.host:
@@ -33,8 +39,14 @@ def ingress_event(extV1beta):
               missing_record = ""
               break
       if missing_record:
+        try:
+          lb_address = event["object"].status.load_balancer.ingress[0].ip
+        except Exception as ex:
+          logger.error(f'-- EVENT {event["type"]} -- Couldn\'t retrieve LoadBalancer address from record \'{missing_record}\'.')
+          continue
+
         record = {
-          "ip_address" : event["object"].status.load_balancer.ingress[0].ip,
+          "ip_address" : lb_address,
           "domain": missing_record,
           "hostname" : ""
         }
@@ -45,7 +57,7 @@ def ingress_event(extV1beta):
           logger.error(f'-- EVENT {event["type"]} -- Error occured while requesting to add {record["domain"]} to DNS')
           logger.error(f'-- EVENT {event["type"]} -- {add_record_resp.json()}')
 
-def ingress_deletion(extV1beta):
+def ingress_deletion(extV1beta, force_deletion):
   dns_records_resp = requests.get(f'http://{Config.PIHOLE_DNS}/dns')
   if dns_records_resp.ok:
     dns_records = dns_records_resp.json()["Content"]
@@ -53,23 +65,43 @@ def ingress_deletion(extV1beta):
   ingress_list = []
   load_balancer_ip = ""
   for ingress in ingress_records.items:
+    try:
+      load_balancer_ip = ingress.status.load_balancer.ingress[0].ip
+    except Exception as ex:
+      if not force_deletion:
+        logger.error(f'-- EVENT DELETE -- Couldn\'t retrieve LoadBalancer ingress from record \'{ingress.metadata.name}\'.')
+      continue
     load_balancer_ip = ingress.status.load_balancer.ingress[0].ip
     for rule in ingress.spec.rules:
       ingress_list.append(rule.host)
   
   for record in dns_records:
-    if record["domain"] not in ingress_list and record["ip_address"] == load_balancer_ip:
-      record_to_delete = {
-        "ip_address": record["ip_address"],
-        "domain": record["domain"],
-        "hostname": record["hostname"]
-      }
-      deletion_respnse = requests.delete(f'http://{Config.PIHOLE_DNS}/dns', json=record_to_delete)
-      if deletion_respnse.ok:
-        logger.info(f'-- EVENT DELETE -- {record["domain"]} has been deleted from DNS')
-      else:
-        logger.error(f'-- EVENT DELETE -- Error occured while requesting to delete {record["domain"]} from DNS')
-        logger.error(f'-- EVENT DELETE -- {deletion_respnse.json()}')
+    if record["domain"] not in ingress_list:
+      if force_deletion:
+        record_to_delete = {
+          "domain": record["domain"],
+        }
+
+        deletion_response = requests.delete(f'http://{Config.PIHOLE_DNS}/dns?forced=true', json=record_to_delete)
+
+        if deletion_response.ok:
+          logger.info(f'-- EVENT DELETE -- {record["domain"]} has been deleted from DNS')
+        else:
+          logger.error(f'-- EVENT DELETE -- Error occured while requesting to delete {record["domain"]} from DNS')
+          logger.error(f'-- EVENT DELETE -- {deletion_response.json()}')
+      elif not force_deletion and record["ip_address"] == load_balancer_ip:
+        record_to_delete = {
+          "ip_address": record["ip_address"],
+          "domain": record["domain"],
+          "hostname": record["hostname"]
+        }
+
+        deletion_response = requests.delete(f'http://{Config.PIHOLE_DNS}/dns', json=record_to_delete)
+        if deletion_response.ok:
+          logger.info(f'-- EVENT DELETE -- {record["domain"]} has been deleted from DNS')
+        else:
+          logger.error(f'-- EVENT DELETE -- Error occured while requesting to delete {record["domain"]} from DNS')
+          logger.error(f'-- EVENT DELETE -- {deletion_response.json()}')
 
 if __name__ == "__main__":
   for key,val in Config.__dict__.items():
@@ -77,6 +109,12 @@ if __name__ == "__main__":
       if val == None or val == "":
         logger.error(f'Environment Variable {key} is not set. Exiting')
         sys.exit(0)
+
+  force_deletion = False
+
+  for flag in sys.argv[1:]:
+    if "-f" == flag or "--force" == flag:
+      force_deletion = True
 
   ioloop = asyncio.get_event_loop()
   try:
@@ -97,7 +135,7 @@ if __name__ == "__main__":
     proc.join(5)
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(ingress_deletion, 'interval', [extV1beta], seconds=15)
+    scheduler.add_job(ingress_deletion, 'interval', [extV1beta, force_deletion], seconds=15)
     scheduler.start()
 
     ioloop.run_forever()

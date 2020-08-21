@@ -1,0 +1,7 @@
+os: linux
+services:
+  - docker
+script:
+  - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+  - docker build -t pobek/external-dns-pihole:${TRAVIS_BRANCH}-${TRAVIS_BUILD_NUMBER} .
+  - docker push pobek/external-dns-pihole:${TRAVIS_BRANCH}-${TRAVIS_BUILD_NUMBER}
